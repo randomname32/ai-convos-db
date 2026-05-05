@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, math
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, math, sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -128,8 +128,29 @@ def extract_content(content) -> dict:
                        for b in blocks if b.get("type") in ("image_asset_pointer", "file") or b.get("content_type") in ("image_asset_pointer", "file")]
     }
 
+# ---- platform ----
+PLATFORM = sys.platform  # 'darwin', 'linux', 'win32'
+
+def _chrome_db_paths(profile: str) -> list[Path]:
+    if PLATFORM == 'darwin': base = Path.home() / "Library/Application Support/Google/Chrome" / profile; return [base / "Cookies", base / "Network/Cookies"]
+    if PLATFORM == 'linux': return [Path.home() / f".config/{b}/{profile}/Cookies" for b in ("google-chrome", "chromium")]
+    return []
+
+def _chrome_key() -> bytes | None:
+    if PLATFORM == 'darwin':
+        r = subprocess.run(["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"], capture_output=True, text=True)
+        return pbkdf2_hmac('sha1', r.stdout.strip().encode(), b'saltysalt', 1003, 16) if r.returncode == 0 else None
+    if PLATFORM == 'linux': return pbkdf2_hmac('sha1', b'peanuts', b'saltysalt', 1, 16)
+    return None
+
+def _chrome_base_dirs() -> list[Path]:
+    if PLATFORM == 'darwin': return [Path.home() / "Library/Application Support/Google/Chrome"]
+    if PLATFORM == 'linux': return [Path.home() / f".config/{b}" for b in ("google-chrome", "chromium")]
+    return []
+
 # ---- cookie extraction ----
 def read_safari_cookies(domain: str) -> dict[str, str]:
+    if PLATFORM != 'darwin': return {}
     path = Path.home() / "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"
     if not path.exists(): path = Path.home() / "Library/Cookies/Cookies.binarycookies"
     if not path.exists(): return {}
@@ -160,12 +181,10 @@ def read_safari_cookies(domain: str) -> dict[str, str]:
 
 def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, str]:
     profile = profile or os.environ.get("CONVOS_CHROME_PROFILE", "Default")
-    db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Cookies"
-    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Network/Cookies"
-    if not db_path.exists(): return {}
-    result = subprocess.run(["security", "find-generic-password", "-w", "-a", "Chrome", "-s", "Chrome Safe Storage"], capture_output=True, text=True)
-    if result.returncode != 0: return {}
-    key = pbkdf2_hmac('sha1', result.stdout.strip().encode(), b'saltysalt', 1003, 16)
+    db_path = next((p for p in _chrome_db_paths(profile) if p.exists()), None)
+    if db_path is None: return {}
+    key = _chrome_key()
+    if key is None: return {}
     cookies = {}
     conn = sqlite3.connect(f"file:{db_path}?mode=ro&nolock=1", uri=True)
     for name, encrypted, host in conn.execute("SELECT name, encrypted_value, host_key FROM cookies WHERE host_key LIKE ?", (f"%{domain}%",)):
@@ -185,6 +204,7 @@ def get_cookies_any(domains: list[str], browser: str = "safari", profile: str | 
     return cookies
 
 def safari_cookie_domains():
+    if PLATFORM != 'darwin': return set()
     path = Path.home() / "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"
     if not path.exists(): path = Path.home() / "Library/Cookies/Cookies.binarycookies"
     if not path.exists(): return set()
@@ -206,18 +226,16 @@ def safari_cookie_domains():
 
 def chrome_cookie_domains(profile: str | None = None):
     profile = profile or os.environ.get("CONVOS_CHROME_PROFILE", "Default")
-    db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Cookies"
-    if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Network/Cookies"
-    if not db_path.exists(): return set()
+    db_path = next((p for p in _chrome_db_paths(profile) if p.exists()), None)
+    if db_path is None: return set()
     conn = sqlite3.connect(f"file:{db_path}?mode=ro&nolock=1", uri=True)
     domains = {r[0] for r in conn.execute("SELECT DISTINCT host_key FROM cookies")}
     conn.close()
     return domains
 
 def chrome_profiles() -> list[str]:
-    base = Path.home() / "Library/Application Support/Google/Chrome"
-    if not base.exists(): return []
-    return [p.name for p in base.iterdir() if p.is_dir() and ((p / "Cookies").exists() or (p / "Network/Cookies").exists())]
+    return [p.name for base in _chrome_base_dirs() if base.exists() for p in base.iterdir()
+            if p.is_dir() and any((p / n).exists() for n in ("Cookies", "Network/Cookies"))]
 
 def chatgpt_profiles(browser: str) -> list[str | None]:
     if browser != "chrome": return [None]
