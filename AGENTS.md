@@ -24,7 +24,7 @@ There is no backward compatibility unless explicitly requested or covered by tes
 Line Budget
 -----------
 
-Stay below 1000 lines of code total (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible — if a dependency only serves an opt-in feature, gate it behind an optional extra (e.g. `[hybrid]` for the embedding/reranker pipeline).
+Stay below 1500 lines of code total (tinygrad-style constraint, enforced by `tests/test_budget.py` via a token-aware count). Any new feature must fit in the remaining budget, so design for minimal line growth and high density. Prefer no new dependencies when possible — if a dependency only serves an opt-in feature, gate it behind an optional extra (e.g. `[hybrid]` for the embedding/reranker pipeline).
 
 **Do:**
 - Pack meaning into each line - comprehensions over loops with append
