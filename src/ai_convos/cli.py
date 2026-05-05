@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, math, sys
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, urllib.parse, re, os, sysconfig, math, sys, shutil, tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -148,6 +148,22 @@ def _chrome_base_dirs() -> list[Path]:
     if PLATFORM == 'linux': return [Path.home() / f".config/{b}" for b in ("google-chrome", "chromium")]
     return []
 
+def _ua(browser: str) -> str:
+    if browser == "firefox": return "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
+    if browser == "chrome": return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+def _firefox_base_dirs() -> list[Path]:
+    h = Path.home()
+    if PLATFORM == 'darwin': return [h / "Library/Application Support/Firefox/Profiles"]
+    if PLATFORM == 'linux': return [h / p for p in (".mozilla/firefox", "snap/firefox/common/.mozilla/firefox", ".var/app/org.mozilla.firefox/.mozilla/firefox")]
+    return []
+
+def _firefox_db_paths(profile: str | None = None) -> list[Path]:
+    bases = [b for b in _firefox_base_dirs() if b.exists()]
+    if profile: return [b / profile / "cookies.sqlite" for b in bases]
+    return [b / d.name / "cookies.sqlite" for b in bases for d in b.iterdir() if d.is_dir()]
+
 # ---- cookie extraction ----
 def read_safari_cookies(domain: str) -> dict[str, str]:
     if PLATFORM != 'darwin': return {}
@@ -195,8 +211,36 @@ def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, st
     conn.close()
     return cookies
 
+def _firefox_conn(db_path: Path) -> sqlite3.Connection:
+    d = Path(tempfile.mkdtemp()); dst = d / "c.sqlite"
+    shutil.copy2(db_path, dst)
+    if (w := db_path.parent / (db_path.name + "-wal")).exists(): shutil.copy2(w, d / "c.sqlite-wal")
+    return sqlite3.connect(str(dst))
+
+def read_firefox_cookies(domain: str, profile: str | None = None) -> dict[str, str]:
+    db_path = next((p for p in _firefox_db_paths(profile) if p.exists()), None)
+    if db_path is None: return {}
+    conn = _firefox_conn(db_path)
+    cookies = {n: v for n, v, _ in conn.execute("SELECT name, value, host FROM moz_cookies WHERE host LIKE ?", (f"%{domain}%",))}
+    conn.close()
+    return cookies
+
+def firefox_cookie_domains(profile: str | None = None) -> set:
+    db_path = next((p for p in _firefox_db_paths(profile) if p.exists()), None)
+    if db_path is None: return set()
+    conn = _firefox_conn(db_path)
+    domains = {r[0] for r in conn.execute("SELECT DISTINCT host FROM moz_cookies")}
+    conn.close()
+    return domains
+
+def firefox_profiles() -> list[str]:
+    return [p.name for base in _firefox_base_dirs() if base.exists() for p in base.iterdir()
+            if p.is_dir() and (p / "cookies.sqlite").exists()]
+
 def get_cookies(domain: str, browser: str = "safari", profile: str | None = None) -> dict[str, str]:
-    return read_safari_cookies(domain) if browser == "safari" else read_chrome_cookies(domain, profile=profile)
+    if browser == "safari": return read_safari_cookies(domain)
+    if browser == "firefox": return read_firefox_cookies(domain, profile=profile)
+    return read_chrome_cookies(domain, profile=profile)
 
 def get_cookies_any(domains: list[str], browser: str = "safari", profile: str | None = None) -> dict[str, str]:
     cookies = {}
@@ -310,9 +354,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
     hosts = [("https://chatgpt.com", ["chatgpt.com"]),
              ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
     debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
-    ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-          if browser == "safari" else
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    ua = _ua(browser)
 
     def fetch_with_profile(profile: str | None) -> ParseResult:
         cookies, base = chatgpt_cookie_base(browser, hosts, profile)
@@ -373,7 +415,7 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
     cookies = get_cookies("claude.ai", browser)
     if not cookies: raise ValueError(f"No Claude cookies found in {browser}")
     headers = {"Origin": "https://claude.ai", "Referer": "https://claude.ai/",
-               "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+               "User-Agent": _ua(browser),
                "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9",
                "anthropic-client-sha": "unknown", "anthropic-client-version": "unknown"}
     print("  claude listing...", flush=True)
@@ -782,13 +824,13 @@ def tools(query: Optional[str] = typer.Argument(None), limit: int = typer.Option
 def doctor(verbose: bool = typer.Option(False, "-v")):
     def has(domains, host): return any(host in d or d in host for d in domains)
     targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai"]
-    for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains)]:
+    for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains), ("firefox", firefox_cookie_domains)]:
         try: domains = getter()
         except PermissionError: typer.echo(f"{name}: no access to cookies"); continue
         summary = ", ".join(f"{t}={'yes' if has(domains, t) else 'no'}" for t in targets)
         typer.echo(f"{name}: {summary}")
         if verbose:
-            cg = read_safari_cookies("chatgpt.com") if name == "safari" else read_chrome_cookies("chatgpt.com")
+            cg = read_safari_cookies("chatgpt.com") if name == "safari" else (read_firefox_cookies("chatgpt.com") if name == "firefox" else read_chrome_cookies("chatgpt.com"))
             keys = set(cg.keys())
             sig = [k for k in ["__Secure-next-auth.session-token", "__Secure-next-auth.session-token.0",
                                "__Secure-next-auth.session-token.1", "cf_clearance", "__cf_bm"] if k in keys]
@@ -854,9 +896,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         profiles = chatgpt_profiles(browser)
         errors = []
         heads = []
-        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-              if browser == "safari" else
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        ua = _ua(browser)
         for profile in profiles:
             try:
                 cookies, base = chatgpt_cookie_base(browser, hosts, profile)
@@ -871,7 +911,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         cookies = get_cookies("claude.ai", browser)
         if not cookies: raise ValueError(f"No Claude cookies found in {browser}")
         headers = {"Origin": "https://claude.ai", "Referer": "https://claude.ai/",
-                   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+                   "User-Agent": _ua(browser),
                    "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9",
                    "anthropic-client-sha": "unknown", "anthropic-client-version": "unknown"}
         orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers)
@@ -884,7 +924,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
     def plan_web(name, fetcher, probe):
         pref = web.get(name, {})
         forced = os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
-        order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
+        order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome", "firefox") if b != pref.get("browser")]
         errors = []
         for b in [x for x in order if x]:
             try:
