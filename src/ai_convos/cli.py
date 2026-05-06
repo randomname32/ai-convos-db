@@ -310,7 +310,7 @@ def chatgpt_headers(cookies, base, ua, browser: str = None, debug_profile: str |
 def merge_results(dst: "ParseResult", src: "ParseResult"):
     dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
 
-def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2, browser: str = None) -> dict:
+def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2, browser: str = None, body: dict = None) -> dict:
     parts = []
     for k, v in cookies.items():
         s = f"{k}={v}"
@@ -324,10 +324,12 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
             if browser:
                 from curl_cffi import requests as _cr
                 curl_hdrs = {k: v for k, v in hdrs.items() if k not in ("Cookie", "User-Agent")}
-                r = _cr.get(url, headers=curl_hdrs, cookies=cookies, impersonate=_cffi_browser(browser), timeout=timeout)
+                fn = _cr.post if body is not None else _cr.get
+                r = fn(url, headers=curl_hdrs, cookies=cookies, impersonate=_cffi_browser(browser), timeout=timeout, json=body)
                 if not r.ok: raise ValueError(f"HTTP Error {r.status_code}: {r.reason}")
                 return r.json()
-            req = urllib.request.Request(url, headers=hdrs)
+            raw = json.dumps(body).encode() if body is not None else None
+            req = urllib.request.Request(url, headers=hdrs, data=raw)
             with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout) as resp:
                 return json.loads(resp.read())
         except Exception as e:
@@ -476,6 +478,54 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
             if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
             continue
         if idx == len(items)-1 or (idx+1) % step == 0: print(f"  claude fetched {fetched}/{len(items)}", flush=True)
+    return r
+
+def fetch_perplexity(browser: str = "firefox", limit: int = 0) -> ParseResult:
+    cookies = get_cookies("perplexity.ai", browser)
+    if not cookies: raise ValueError(f"No Perplexity cookies found in {browser}")
+    base = "https://www.perplexity.ai"
+    r, offset, fetched = ParseResult(), 0, 0
+    def pplx_ans(raw):
+        if not raw: return ""
+        if isinstance(raw, str):
+            try: return json.loads(raw).get("answer", raw)
+            except Exception: return raw
+        return str(raw)
+    def parse_entry(cid, e):
+        ts = ts_from_iso(e.get("last_query_datetime")) if e.get("last_query_datetime") else None
+        model, uid = e.get("display_model"), e.get("uuid", "")
+        msgs = []
+        if q := e.get("query_str"):
+            msgs.append(dict(id=gen_id("perplexity", f"{cid}:{uid}:q"), conversation_id=cid, role="user",
+                            content=q, thinking=None, created_at=ts, model=None, metadata="{}"))
+        steps = json.loads(e["text"]) if isinstance(e.get("text"), str) else []
+        final = next((s for s in steps if s.get("step_type") == "FINAL"), None)
+        if final and (ans := pplx_ans(final.get("content", {}).get("answer", ""))):
+            msgs.append(dict(id=gen_id("perplexity", f"{cid}:{uid}:a"), conversation_id=cid, role="assistant",
+                            content=ans, thinking=None, created_at=ts, model=model, metadata="{}"))
+        elif ans := pplx_ans(e.get("first_answer", "")):
+            msgs.append(dict(id=gen_id("perplexity", f"{cid}:{uid}:a"), conversation_id=cid, role="assistant",
+                            content=ans, thinking=None, created_at=ts, model=model, metadata="{}"))
+        return msgs
+    while True:
+        threads = fetch_json(f"{base}/rest/thread/list_ask_threads", cookies, browser=browser, body={"offset": offset, "limit": 20})
+        if not threads: break
+        for t in threads:
+            cid = gen_id("perplexity", t["uuid"])
+            ts = ts_from_iso(t.get("last_query_datetime"))
+            r.convs.append(dict(id=cid, source="perplexity", title=t.get("title"),
+                               created_at=ts, updated_at=ts, model=t.get("display_model"),
+                               cwd=None, git_branch=None, project_id=None, metadata="{}"))
+            if t.get("query_count", 1) > 1:
+                detail = fetch_json(f"{base}/rest/thread/{t['uuid']}", cookies, browser=browser)
+                for e in detail.get("entries", []): r.msgs += parse_entry(cid, e)
+            else:
+                r.msgs += parse_entry(cid, t)
+            fetched += 1
+            if limit > 0 and fetched >= limit: break
+        typer.echo(f"  perplexity fetched {fetched}")
+        if not threads[0].get("has_next_page") or (limit > 0 and fetched >= limit): break
+        offset += len(threads)
     return r
 
 # ---- file parsers ----
@@ -832,7 +882,7 @@ def tools(query: Optional[str] = typer.Argument(None), limit: int = typer.Option
 @app.command()
 def doctor(verbose: bool = typer.Option(False, "-v")):
     def has(domains, host): return any(host in d or d in host for d in domains)
-    targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai"]
+    targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai", "perplexity.ai"]
     for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains), ("firefox", firefox_cookie_domains)]:
         try: domains = getter()
         except PermissionError: typer.echo(f"{name}: no access to cookies"); continue
@@ -930,6 +980,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         if not items: return None
         item = items[0]
         return f"{item['uuid']}:{item.get('updated_at') or item.get('created_at')}"
+    def probe_perplexity(browser):
+        cookies = get_cookies("perplexity.ai", browser)
+        if not cookies: raise ValueError(f"No Perplexity cookies found in {browser}")
+        threads = fetch_json("https://www.perplexity.ai/rest/thread/list_ask_threads", cookies, browser=browser, body={"offset": 0, "limit": 1})
+        if not threads: return None
+        return f"{threads[0]['uuid']}:{threads[0].get('last_query_datetime')}"
     def plan_web(name, fetcher, probe):
         pref = web.get(name, {})
         forced = os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
@@ -968,6 +1024,7 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
             start("Codex", "codex"); jobs += [j for j in [plan_local("codex", p, parse_codex)] if j]
         start("ChatGPT", "chatgpt"); jobs += [j for j in [plan_web("chatgpt", fetch_chatgpt, probe_chatgpt)] if j]
         start("Claude", "claude"); jobs += [j for j in [plan_web("claude", fetch_claude, probe_claude)] if j]
+        start("Perplexity", "perplexity"); jobs += [j for j in [plan_web("perplexity", fetch_perplexity, probe_perplexity)] if j]
         verbose and typer.echo(f"Planning took {time.perf_counter()-t0:.2f}s")
         if jobs:
             with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as ex:
