@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, math
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, re, os, sysconfig, math, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -167,7 +167,7 @@ def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, st
     if result.returncode != 0: return {}
     key = pbkdf2_hmac('sha1', result.stdout.strip().encode(), b'saltysalt', 1003, 16)
     cookies = {}
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro&nolock=1", uri=True)
+    conn = sqlite3.connect(f"file:{urllib.parse.quote(str(db_path), safe='/')}?mode=ro&nolock=1", uri=True)
     for name, encrypted, host in conn.execute("SELECT name, encrypted_value, host_key FROM cookies WHERE host_key LIKE ?", (f"%{domain}%",)):
         if encrypted[:3] == b'v10':
             cipher = Cipher(algorithms.AES(key), modes.CBC(b' ' * 16))
@@ -209,7 +209,7 @@ def chrome_cookie_domains(profile: str | None = None):
     db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Cookies"
     if not db_path.exists(): db_path = Path.home() / "Library/Application Support/Google/Chrome" / profile / "Network/Cookies"
     if not db_path.exists(): return set()
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro&nolock=1", uri=True)
+    conn = sqlite3.connect(f"file:{urllib.parse.quote(str(db_path), safe='/')}?mode=ro&nolock=1", uri=True)
     domains = {r[0] for r in conn.execute("SELECT DISTINCT host_key FROM cookies")}
     conn.close()
     return domains
@@ -794,9 +794,9 @@ def install_skills():
 @app.command()
 def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional[str] = typer.Option(None, "-s")):
     if (conn := _ro()) is None: return
-    where = f"WHERE c.source = '{source}'" if source else ""
+    where, wparams = ("WHERE c.source = ?", [source]) if source else ("", [])
     if fmt == "json":
-        rows = conn.execute(f"SELECT c.id, c.source, c.title, c.created_at, c.updated_at, c.model, c.cwd, c.git_branch, c.project_id FROM conversations c {where}").fetchall()
+        rows = conn.execute(f"SELECT c.id, c.source, c.title, c.created_at, c.updated_at, c.model, c.cwd, c.git_branch, c.project_id FROM conversations c {where}", wparams).fetchall()
         result = []
         for r in rows:
             msgs = [dict(role=m[0], content=m[1], thinking=m[2], created_at=str(m[3]) if m[3] else None, model=m[4])
@@ -809,7 +809,7 @@ def export(output: Path, fmt: str = typer.Option("json", "-f"), source: Optional
                               model=r[5], cwd=r[6], git_branch=r[7], project_id=r[8], messages=msgs, tool_calls=tcs, file_edits=edits))
         output.write_text(json.dumps(result, indent=2))
     else:
-        conn.execute(f"COPY (SELECT c.id, c.source, c.title, c.cwd, m.role, m.content, m.created_at FROM conversations c JOIN messages m ON c.id = m.conversation_id {where} ORDER BY c.created_at, m.created_at) TO '{output}' (HEADER)")
+        conn.execute(f"COPY (SELECT c.id, c.source, c.title, c.cwd, m.role, m.content, m.created_at FROM conversations c JOIN messages m ON c.id = m.conversation_id {where} ORDER BY c.created_at, m.created_at) TO ? (HEADER)", wparams + [str(output)])
     conn.close(); typer.echo(f"Exported to {output}")
 
 @app.command()
