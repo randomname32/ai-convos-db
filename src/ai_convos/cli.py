@@ -148,6 +148,9 @@ def _chrome_base_dirs() -> list[Path]:
     if PLATFORM == 'linux': return [Path.home() / f".config/{b}" for b in ("google-chrome", "chromium")]
     return []
 
+def _cffi_browser(browser: str) -> str:
+    return {"firefox": "firefox133", "chrome": "chrome136", "safari": "safari17_0"}.get(browser, "chrome136")
+
 def _ua(browser: str) -> str:
     if browser == "firefox": return "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
     if browser == "chrome": return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -291,12 +294,12 @@ def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profil
         if c := get_cookies_any(domains, browser, profile=profile): return c, url
     raise ValueError(f"No ChatGPT cookies found in {browser}" + (f" profile {profile}" if profile else ""))
 
-def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
+def chatgpt_headers(cookies, base, ua, browser: str = None, debug_profile: str | None = None):
     headers = {"Origin": base, "Referer": f"{base}/", "User-Agent": ua, "Accept": "application/json",
                "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
                "Sec-Fetch-Dest": "empty"}
     try:
-        session = fetch_json(f"{base}/api/auth/session", cookies, headers)
+        session = fetch_json(f"{base}/api/auth/session", cookies, headers, browser=browser)
         if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
         if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
         if debug_profile: typer.echo(f"  chatgpt chrome profile={debug_profile} user={session.get('user', {}).get('email')}", flush=True)
@@ -307,7 +310,7 @@ def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
 def merge_results(dst: "ParseResult", src: "ParseResult"):
     dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
 
-def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2) -> dict:
+def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2, browser: str = None) -> dict:
     parts = []
     for k, v in cookies.items():
         s = f"{k}={v}"
@@ -316,9 +319,15 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
         parts.append(s)
     cookie_str = "; ".join(parts)
     hdrs = {"Cookie": cookie_str, "User-Agent": "Mozilla/5.0", "Accept": "application/json", **(headers or {})}
-    req = urllib.request.Request(url, headers=hdrs)
     for i in range(retries+1):
         try:
+            if browser:
+                from curl_cffi import requests as _cr
+                curl_hdrs = {k: v for k, v in hdrs.items() if k not in ("Cookie", "User-Agent")}
+                r = _cr.get(url, headers=curl_hdrs, cookies=cookies, impersonate=_cffi_browser(browser), timeout=timeout)
+                if not r.ok: raise ValueError(f"HTTP Error {r.status_code}: {r.reason}")
+                return r.json()
+            req = urllib.request.Request(url, headers=hdrs)
             with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout) as resp:
                 return json.loads(resp.read())
         except Exception as e:
@@ -358,12 +367,12 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
 
     def fetch_with_profile(profile: str | None) -> ParseResult:
         cookies, base = chatgpt_cookie_base(browser, hosts, profile)
-        headers = chatgpt_headers(cookies, base, ua, debug_profile=profile if debug else None)
+        headers = chatgpt_headers(cookies, base, ua, browser=browser, debug_profile=profile if debug else None)
         r = ParseResult()
         def parse_item_raw(item):
             cid = gen_id("chatgpt", item["id"])
             gizmo = item.get("gizmo_id")
-            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60)
+            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60, browser=browser)
             msgs, tools, attachs = [], [], []
             for nid, node in conv.get("mapping", {}).items():
                 if not (msg := node.get("message")): continue
@@ -386,7 +395,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
         def parse_item(item): return safe_parse(f"chatgpt web conv {item.get('id') if isinstance(item, dict) else 'unknown'}", parse_item_raw, item)
         offset, total, fetched, seen = 0, None, 0, set()
         while True:
-            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=60)
+            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=60, browser=browser)
             total = total if total is not None else data.get("total")
             items, keys = data.get("items", []), ",".join(data.keys())
             if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={keys}", flush=True)
@@ -419,11 +428,11 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
                "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9",
                "anthropic-client-sha": "unknown", "anthropic-client-version": "unknown"}
     print("  claude listing...", flush=True)
-    orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers)
+    orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers, browser=browser)
     org_id = orgs[0]["uuid"] if orgs else None
     if not org_id: raise ValueError("Could not get Claude org ID")
     r = ParseResult()
-    data = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers)
+    data = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers, browser=browser)
     items = data if limit == 0 else data[:limit]
     if items: print(f"  claude total {len(items)}", flush=True)
     fetched, step = 0, max(1, len(items)//10)
@@ -437,7 +446,7 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
         r.convs.append(dict(id=cid, source="claude", title=item.get("name"), created_at=ts_from_iso(item.get("created_at")),
                            updated_at=ts_from_iso(item.get("updated_at")), model=item.get("model"), cwd=None, git_branch=None,
                            project_id=project, metadata=json.dumps({"project_uuid": project}) if project else "{}"))
-        conv = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{item['uuid']}", cookies, headers)
+        conv = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{item['uuid']}", cookies, headers, browser=browser)
         for m in conv.get("chat_messages", []):
             mid = gen_id("claude", f"{cid}:{m.get('uuid', '')}")
             ts = ts_from_iso(m.get("created_at"))
@@ -900,8 +909,8 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         for profile in profiles:
             try:
                 cookies, base = chatgpt_cookie_base(browser, hosts, profile)
-                headers = chatgpt_headers(cookies, base, ua)
-                items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers)["items"]
+                headers = chatgpt_headers(cookies, base, ua, browser=browser)
+                items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers, browser=browser)["items"]
                 if items: heads.append(f"{profile or 'default'}:{items[0]['id']}:{items[0].get('update_time')}")
             except Exception as e:
                 errors.append(f"chatgpt.com{f'/{profile}' if profile else ''}: {e}")
@@ -914,10 +923,10 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
                    "User-Agent": _ua(browser),
                    "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9",
                    "anthropic-client-sha": "unknown", "anthropic-client-version": "unknown"}
-        orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers)
+        orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers, browser=browser)
         org_id = orgs[0]["uuid"] if orgs else None
         if not org_id: raise ValueError("Could not get Claude org ID")
-        items = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers)
+        items = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers, browser=browser)
         if not items: return None
         item = items[0]
         return f"{item['uuid']}:{item.get('updated_at') or item.get('created_at')}"
