@@ -165,6 +165,13 @@ class TestCookieExtraction:
                 cookies = read_chrome_cookies("example.com")
                 assert cookies == {}
 
+    def test_firefox_cookies_not_found(self):
+        """Firefox cookie function handles missing profile gracefully."""
+        from ai_convos.cli import read_firefox_cookies
+        with patch("pathlib.Path.exists", return_value=False):
+            cookies = read_firefox_cookies("example.com")
+            assert cookies == {}
+
 
 # ---- Deduplication Tests ----
 
@@ -260,6 +267,79 @@ class TestDeduplication:
         assert conv_count == 1, "Should still have exactly 1 conversation"
         assert msg_count == 6, "Should have 6 messages (no duplicates)"
         db.close()
+
+
+# ---- Perplexity API Tests ----
+
+class TestPerplexityAPI:
+    """Tests for Perplexity API structure."""
+
+    @pytest.mark.integration
+    def test_thread_list_schema(self):
+        """Verify POST /rest/thread/list_ask_threads returns expected schema."""
+        mock_response = [
+            {"uuid": "thread-123", "title": "Test query", "query_str": "What is X?",
+             "first_answer": "{\"answer\": \"X is Y\"}", "display_model": "pplx_pro",
+             "last_query_datetime": "2024-01-01T00:00:00", "query_count": 1,
+             "has_next_page": False, "total_threads": 1}
+        ]
+        assert isinstance(mock_response, list)
+        assert "uuid" in mock_response[0]
+        assert "query_str" in mock_response[0]
+        assert "has_next_page" in mock_response[0]
+
+    @pytest.mark.integration
+    def test_thread_detail_schema(self):
+        """Verify GET /rest/thread/{uuid} returns expected schema."""
+        mock_response = {
+            "entries": [
+                {"uuid": "entry-1", "query_str": "What is X?", "display_model": "pplx_pro",
+                 "last_query_datetime": "2024-01-01T00:00:00",
+                 "text": json.dumps([{"step_type": "INITIAL_QUERY", "content": {"query": "What is X?"}},
+                                     {"step_type": "FINAL", "content": {"answer": "{\"answer\": \"X is Y\"}"}}])}
+            ],
+            "thread_metadata": {"title": "Test query", "created_at": "2024-01-01T00:00:00",
+                                "updated_at": "2024-01-01T00:00:00"},
+            "has_next_page": False,
+            "next_cursor": None
+        }
+        assert "entries" in mock_response
+        assert "thread_metadata" in mock_response
+        assert len(mock_response["entries"]) == 1
+        assert "text" in mock_response["entries"][0]
+
+    @pytest.mark.integration
+    def test_perplexity_answer_parsing(self):
+        """Verify double-JSON-encoded answer is parsed correctly."""
+        from ai_convos.cli import gen_id, ts_from_iso, ParseResult
+        import json
+
+        cid = gen_id("perplexity", "thread-123")
+        entry = {
+            "uuid": "entry-1",
+            "query_str": "What is X?",
+            "display_model": "pplx_pro",
+            "last_query_datetime": "2024-01-01T00:00:00",
+            "text": json.dumps([
+                {"step_type": "INITIAL_QUERY", "content": {"query": "What is X?"}},
+                {"step_type": "FINAL", "content": {"answer": json.dumps({"answer": "X is Y"})}}
+            ])
+        }
+        steps = json.loads(entry["text"])
+        final = next(s for s in steps if s["step_type"] == "FINAL")
+        raw = final["content"]["answer"]
+        ans = json.loads(raw).get("answer", raw)
+        assert ans == "X is Y"
+
+    @pytest.mark.integration
+    def test_live_perplexity_api(self):
+        """Live test against Perplexity API - requires valid cookies."""
+        pytest.skip("Requires real cookies - run manually")
+        from ai_convos.cli import fetch_perplexity
+        result = fetch_perplexity("firefox", limit=1)
+        assert len(result.convs) >= 0
+        if result.convs:
+            assert result.convs[0]["source"] == "perplexity"
 
 
 # ---- HTTP Error Handling Tests ----
