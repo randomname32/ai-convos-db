@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, urllib.parse, re, os, sysconfig, math, sys
+import json, time, zipfile, hashlib, struct, sqlite3, subprocess, ssl, urllib.request, urllib.parse, re, os, sysconfig, math, sys, shutil, tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -148,6 +148,25 @@ def _chrome_base_dirs() -> list[Path]:
     if PLATFORM == 'linux': return [Path.home() / f".config/{b}" for b in ("google-chrome", "chromium")]
     return []
 
+def _cffi_browser(browser: str) -> str:
+    return {"firefox": "firefox133", "chrome": "chrome136", "safari": "safari17_0"}.get(browser, "chrome136")
+
+def _ua(browser: str) -> str:
+    if browser == "firefox": return "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
+    if browser == "chrome": return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+def _firefox_base_dirs() -> list[Path]:
+    h = Path.home()
+    if PLATFORM == 'darwin': return [h / "Library/Application Support/Firefox/Profiles"]
+    if PLATFORM == 'linux': return [h / p for p in (".mozilla/firefox", "snap/firefox/common/.mozilla/firefox", ".var/app/org.mozilla.firefox/.mozilla/firefox")]
+    return []
+
+def _firefox_db_paths(profile: str | None = None) -> list[Path]:
+    bases = [b for b in _firefox_base_dirs() if b.exists()]
+    if profile: return [b / profile / "cookies.sqlite" for b in bases]
+    return [b / d.name / "cookies.sqlite" for b in bases for d in b.iterdir() if d.is_dir()]
+
 # ---- cookie extraction ----
 def read_safari_cookies(domain: str) -> dict[str, str]:
     if PLATFORM != 'darwin': return {}
@@ -195,8 +214,36 @@ def read_chrome_cookies(domain: str, profile: str | None = None) -> dict[str, st
     conn.close()
     return cookies
 
+def _firefox_conn(db_path: Path) -> sqlite3.Connection:
+    d = Path(tempfile.mkdtemp()); dst = d / "c.sqlite"
+    shutil.copy2(db_path, dst)
+    if (w := db_path.parent / (db_path.name + "-wal")).exists(): shutil.copy2(w, d / "c.sqlite-wal")
+    return sqlite3.connect(str(dst))
+
+def read_firefox_cookies(domain: str, profile: str | None = None) -> dict[str, str]:
+    db_path = next((p for p in _firefox_db_paths(profile) if p.exists()), None)
+    if db_path is None: return {}
+    conn = _firefox_conn(db_path)
+    cookies = {n: v for n, v, _ in conn.execute("SELECT name, value, host FROM moz_cookies WHERE host LIKE ?", (f"%{domain}%",))}
+    conn.close()
+    return cookies
+
+def firefox_cookie_domains(profile: str | None = None) -> set:
+    db_path = next((p for p in _firefox_db_paths(profile) if p.exists()), None)
+    if db_path is None: return set()
+    conn = _firefox_conn(db_path)
+    domains = {r[0] for r in conn.execute("SELECT DISTINCT host FROM moz_cookies")}
+    conn.close()
+    return domains
+
+def firefox_profiles() -> list[str]:
+    return [p.name for base in _firefox_base_dirs() if base.exists() for p in base.iterdir()
+            if p.is_dir() and (p / "cookies.sqlite").exists()]
+
 def get_cookies(domain: str, browser: str = "safari", profile: str | None = None) -> dict[str, str]:
-    return read_safari_cookies(domain) if browser == "safari" else read_chrome_cookies(domain, profile=profile)
+    if browser == "safari": return read_safari_cookies(domain)
+    if browser == "firefox": return read_firefox_cookies(domain, profile=profile)
+    return read_chrome_cookies(domain, profile=profile)
 
 def get_cookies_any(domains: list[str], browser: str = "safari", profile: str | None = None) -> dict[str, str]:
     cookies = {}
@@ -247,12 +294,12 @@ def chatgpt_cookie_base(browser: str, hosts: list[tuple[str, list[str]]], profil
         if c := get_cookies_any(domains, browser, profile=profile): return c, url
     raise ValueError(f"No ChatGPT cookies found in {browser}" + (f" profile {profile}" if profile else ""))
 
-def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
+def chatgpt_headers(cookies, base, ua, browser: str = None, debug_profile: str | None = None):
     headers = {"Origin": base, "Referer": f"{base}/", "User-Agent": ua, "Accept": "application/json",
                "Accept-Language": "en-US,en;q=0.9", "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
                "Sec-Fetch-Dest": "empty"}
     try:
-        session = fetch_json(f"{base}/api/auth/session", cookies, headers)
+        session = fetch_json(f"{base}/api/auth/session", cookies, headers, browser=browser)
         if token := session.get("accessToken"): headers["Authorization"] = f"Bearer {token}"
         if aid := session.get("account", {}).get("id"): headers["ChatGPT-Account-ID"] = aid
         if debug_profile: typer.echo(f"  chatgpt chrome profile={debug_profile} user={session.get('user', {}).get('email')}", flush=True)
@@ -263,7 +310,7 @@ def chatgpt_headers(cookies, base, ua, debug_profile: str | None = None):
 def merge_results(dst: "ParseResult", src: "ParseResult"):
     dst.convs += src.convs; dst.msgs += src.msgs; dst.tools += src.tools; dst.attachs += src.attachs
 
-def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2) -> dict:
+def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout: int = 30, retries: int = 2, browser: str = None) -> dict:
     parts = []
     for k, v in cookies.items():
         s = f"{k}={v}"
@@ -272,9 +319,15 @@ def fetch_json(url: str, cookies: dict[str, str], headers: dict = None, timeout:
         parts.append(s)
     cookie_str = "; ".join(parts)
     hdrs = {"Cookie": cookie_str, "User-Agent": "Mozilla/5.0", "Accept": "application/json", **(headers or {})}
-    req = urllib.request.Request(url, headers=hdrs)
     for i in range(retries+1):
         try:
+            if browser:
+                from curl_cffi import requests as _cr
+                curl_hdrs = {k: v for k, v in hdrs.items() if k not in ("Cookie", "User-Agent")}
+                r = _cr.get(url, headers=curl_hdrs, cookies=cookies, impersonate=_cffi_browser(browser), timeout=timeout)
+                if not r.ok: raise ValueError(f"HTTP Error {r.status_code}: {r.reason}")
+                return r.json()
+            req = urllib.request.Request(url, headers=hdrs)
             with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=timeout) as resp:
                 return json.loads(resp.read())
         except Exception as e:
@@ -310,18 +363,16 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
     hosts = [("https://chatgpt.com", ["chatgpt.com"]),
              ("https://chat.openai.com", ["chat.openai.com", "openai.com"])]
     debug = os.environ.get("CONVOS_CHATGPT_DEBUG")
-    ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-          if browser == "safari" else
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    ua = _ua(browser)
 
     def fetch_with_profile(profile: str | None) -> ParseResult:
         cookies, base = chatgpt_cookie_base(browser, hosts, profile)
-        headers = chatgpt_headers(cookies, base, ua, debug_profile=profile if debug else None)
+        headers = chatgpt_headers(cookies, base, ua, browser=browser, debug_profile=profile if debug else None)
         r = ParseResult()
         def parse_item_raw(item):
             cid = gen_id("chatgpt", item["id"])
             gizmo = item.get("gizmo_id")
-            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60)
+            conv = fetch_json(f"{base}/backend-api/conversation/{item['id']}", cookies, headers, timeout=60, browser=browser)
             msgs, tools, attachs = [], [], []
             for nid, node in conv.get("mapping", {}).items():
                 if not (msg := node.get("message")): continue
@@ -344,7 +395,7 @@ def fetch_chatgpt(browser: str = "safari", limit: int = 0) -> ParseResult:
         def parse_item(item): return safe_parse(f"chatgpt web conv {item.get('id') if isinstance(item, dict) else 'unknown'}", parse_item_raw, item)
         offset, total, fetched, seen = 0, None, 0, set()
         while True:
-            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=60)
+            data = fetch_json(f"{base}/backend-api/conversations?offset={offset}&limit=100", cookies, headers, timeout=60, browser=browser)
             total = total if total is not None else data.get("total")
             items, keys = data.get("items", []), ",".join(data.keys())
             if debug: print(f"  chatgpt page offset={offset} items={len(items)} total={total} keys={keys}", flush=True)
@@ -373,15 +424,15 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
     cookies = get_cookies("claude.ai", browser)
     if not cookies: raise ValueError(f"No Claude cookies found in {browser}")
     headers = {"Origin": "https://claude.ai", "Referer": "https://claude.ai/",
-               "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+               "User-Agent": _ua(browser),
                "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9",
                "anthropic-client-sha": "unknown", "anthropic-client-version": "unknown"}
     print("  claude listing...", flush=True)
-    orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers)
+    orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers, browser=browser)
     org_id = orgs[0]["uuid"] if orgs else None
     if not org_id: raise ValueError("Could not get Claude org ID")
     r = ParseResult()
-    data = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers)
+    data = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers, browser=browser)
     items = data if limit == 0 else data[:limit]
     if items: print(f"  claude total {len(items)}", flush=True)
     fetched, step = 0, max(1, len(items)//10)
@@ -395,7 +446,7 @@ def fetch_claude(browser: str = "safari", limit: int = 0, since: datetime = None
         r.convs.append(dict(id=cid, source="claude", title=item.get("name"), created_at=ts_from_iso(item.get("created_at")),
                            updated_at=ts_from_iso(item.get("updated_at")), model=item.get("model"), cwd=None, git_branch=None,
                            project_id=project, metadata=json.dumps({"project_uuid": project}) if project else "{}"))
-        conv = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{item['uuid']}", cookies, headers)
+        conv = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations/{item['uuid']}", cookies, headers, browser=browser)
         for m in conv.get("chat_messages", []):
             mid = gen_id("claude", f"{cid}:{m.get('uuid', '')}")
             ts = ts_from_iso(m.get("created_at"))
@@ -782,13 +833,13 @@ def tools(query: Optional[str] = typer.Argument(None), limit: int = typer.Option
 def doctor(verbose: bool = typer.Option(False, "-v")):
     def has(domains, host): return any(host in d or d in host for d in domains)
     targets = ["chatgpt.com", "chat.openai.com", "openai.com", "claude.ai"]
-    for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains)]:
+    for name, getter in [("safari", safari_cookie_domains), ("chrome", chrome_cookie_domains), ("firefox", firefox_cookie_domains)]:
         try: domains = getter()
         except PermissionError: typer.echo(f"{name}: no access to cookies"); continue
         summary = ", ".join(f"{t}={'yes' if has(domains, t) else 'no'}" for t in targets)
         typer.echo(f"{name}: {summary}")
         if verbose:
-            cg = read_safari_cookies("chatgpt.com") if name == "safari" else read_chrome_cookies("chatgpt.com")
+            cg = read_safari_cookies("chatgpt.com") if name == "safari" else (read_firefox_cookies("chatgpt.com") if name == "firefox" else read_chrome_cookies("chatgpt.com"))
             keys = set(cg.keys())
             sig = [k for k in ["__Secure-next-auth.session-token", "__Secure-next-auth.session-token.0",
                                "__Secure-next-auth.session-token.1", "cf_clearance", "__cf_bm"] if k in keys]
@@ -854,14 +905,12 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         profiles = chatgpt_profiles(browser)
         errors = []
         heads = []
-        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-              if browser == "safari" else
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        ua = _ua(browser)
         for profile in profiles:
             try:
                 cookies, base = chatgpt_cookie_base(browser, hosts, profile)
-                headers = chatgpt_headers(cookies, base, ua)
-                items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers)["items"]
+                headers = chatgpt_headers(cookies, base, ua, browser=browser)
+                items = fetch_json(f"{base}/backend-api/conversations?offset=0&limit=1", cookies, headers, browser=browser)["items"]
                 if items: heads.append(f"{profile or 'default'}:{items[0]['id']}:{items[0].get('update_time')}")
             except Exception as e:
                 errors.append(f"chatgpt.com{f'/{profile}' if profile else ''}: {e}")
@@ -871,20 +920,20 @@ def sync(watch: bool = typer.Option(False, "-w"), interval: int = typer.Option(3
         cookies = get_cookies("claude.ai", browser)
         if not cookies: raise ValueError(f"No Claude cookies found in {browser}")
         headers = {"Origin": "https://claude.ai", "Referer": "https://claude.ai/",
-                   "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+                   "User-Agent": _ua(browser),
                    "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9",
                    "anthropic-client-sha": "unknown", "anthropic-client-version": "unknown"}
-        orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers)
+        orgs = fetch_json("https://claude.ai/api/organizations", cookies, headers, browser=browser)
         org_id = orgs[0]["uuid"] if orgs else None
         if not org_id: raise ValueError("Could not get Claude org ID")
-        items = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers)
+        items = fetch_json(f"https://claude.ai/api/organizations/{org_id}/chat_conversations", cookies, headers, browser=browser)
         if not items: return None
         item = items[0]
         return f"{item['uuid']}:{item.get('updated_at') or item.get('created_at')}"
     def plan_web(name, fetcher, probe):
         pref = web.get(name, {})
         forced = os.environ.get(f"CONVOS_{name.upper()}_BROWSER")
-        order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome") if b != pref.get("browser")]
+        order = [forced] if forced else [pref.get("browser")] + [b for b in ("safari", "chrome", "firefox") if b != pref.get("browser")]
         errors = []
         for b in [x for x in order if x]:
             try:
