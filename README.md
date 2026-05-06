@@ -9,7 +9,7 @@
 wget -qO- https://raw.githubusercontent.com/RobertBiehl/ai-convos-db/master/scripts/install.sh | bash
 ```
 
-Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. One file, one DB, fast full-text search.
+Local-first, searchable archive for ChatGPT, Claude, Perplexity, and Codex conversations. One file, one DB, fast full-text search. Runs on macOS and Linux.
 
 ## Why this exists
 
@@ -22,9 +22,10 @@ Local-first, searchable archive for ChatGPT, Claude, and Codex conversations. On
 
 - Fast full-text search with filters (source, days, role, thinking)
 - Hybrid semantic search (BM25 + embeddings + Qwen3 reranker) via `convos query`
-- Fetch from ChatGPT and Claude using browser cookies
+- Fetch from ChatGPT, Claude, and Perplexity using browser cookies (Safari, Chrome, Firefox)
 - Import exports from ChatGPT, Claude, Claude Code, and Codex
 - Sync Claude Code + Codex sessions on a schedule
+- Works on macOS and Linux
 - Export to JSON or CSV
 
 ## Install
@@ -49,7 +50,7 @@ convos sync
 convos search "prompt" -s claude -n 10
 ```
 
-If Safari cookies are protected by macOS privacy, `sync` will fall back to Chrome.
+On macOS, if Safari cookies are protected by privacy settings, `sync` will fall back to Chrome or Firefox. On Linux, Chrome and Firefox are supported (`-b chrome` or `-b firefox`).
 
 ## Common commands
 
@@ -147,13 +148,16 @@ Data lives in `<root>/data/convos.db` (DuckDB). Default root is `~/.convos` (ove
 
 This is local-first. Your data never leaves your machine unless you export it.
 
-On macOS, Safari cookie access requires Full Disk Access for your terminal.
-If you prefer not to grant it, use Chrome cookies with `-b chrome`.
+On macOS, Safari cookie access requires Full Disk Access for your terminal. If you prefer not to grant it, use `-b chrome` or `-b firefox`.
+On Linux, Chrome (`~/.config/google-chrome`) and Firefox (native, Snap, Flatpak) are supported.
 
 ## FAQ
 
 Q: Why is fetch failing on Safari?
-A: macOS blocks access to Safari cookies without Full Disk Access. Use `-b chrome` or grant access.
+A: macOS blocks access to Safari cookies without Full Disk Access. Use `-b chrome` or `-b firefox` or grant access.
+
+Q: Which browsers are supported?
+A: Safari (macOS only), Chrome/Chromium, and Firefox. On Linux, use `-b chrome` or `-b firefox`.
 
 Q: Where is the database stored?
 A: `~/.convos/data/convos.db` by default (override with `CONVOS_PROJECT_ROOT`).

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+- Add Linux support: Chrome cookie extraction via `~/.config/google-chrome` and `~/.config/chromium`, decryption key via PBKDF2 fallback.
+- Add Firefox cookie support on Linux (native, Snap, Flatpak) and macOS; WAL-safe reads while browser is running.
+- Add curl-cffi (required dependency) for browser TLS impersonation, fixing Cloudflare bot detection that blocked ChatGPT, Claude, and Perplexity web sync.
+- Add Perplexity AI web conversation sync via `POST /rest/thread/list_ask_threads`.
+- Add `doctor` checks for Firefox cookies and Perplexity.
+- Fix SQL injection in `convos export` (source filter and output path now use parameterized queries).
+- Fix SQLite URI construction in Chrome cookie reader (path percent-encoded via `urllib.parse.quote`).
+- Raise line budget from 1000 to 1500.
+
 ## 0.2.0
 - Add opt-in hybrid semantic search with `convos query`: BM25 + local embeddings + Qwen3 reranking.
 - Add `convos embed` to backfill embeddings without fetching new web conversations.
